@@ -284,52 +284,53 @@ def webhook_bsale():
         if not res_id: return jsonify({"error": "Sin resourceId"}), 400
         res_id = int(res_id)
 
-        if topic in ("document/create", "document.create", "document/update", "document.update", "document/annul", "document.annul"):
+        if topic in ("document/create", "document.create", "document/update", "document.update", "document/annul", "document.annul", "document"):
             process_document(res_id)
-        elif topic in ("product/create", "product.create", "product/update", "product.update"):
+        elif topic in ("product/create", "product.create", "product/update", "product.update", "product"):
             process_product(res_id)
-        elif topic in ("client/create", "client.create", "client/update", "client.update"):
+        elif topic in ("client/create", "client.create", "client/update", "client.update", "client"):
             process_client(res_id)
-        elif topic in ("stock/update", "stock.update"):
-            # Obtenemos detalle del recurso devuelto (es un stock id)
-            r = requests.get(f"{API}/stocks/{res_id}.json", headers=H)
+        elif topic in ("stock/update", "stock.update", "stock"):
+            # En webhooks v2 de stock, el resourceId suele ser el variantId. Consultamos el endpoint de stocks filtrando por variante.
+            vid = res_id
+            r = requests.get(f"{API}/stocks.json?variantid={vid}", headers=H)
             if r.status_code == 200:
-                s_data = r.json()
-                vid = s_data.get("variantId")
-                oid = s_data.get("officeId")
-                
-                # Fetch office name
-                oname = ""
-                if oid:
-                    ro = requests.get(f"{API}/offices/{oid}.json", headers=H)
-                    if ro.status_code == 200: oname = safe(ro.json().get("name",""), 150)
-                
-                # Insert/Update stock
-                if vid and oid:
-                    conn = get_db()
-                    cur = conn.cursor()
-                    cur.execute("SELECT sku FROM productos WHERE variante_id=%s LIMIT 1", (vid,))
-                    row = cur.fetchone()
-                    sku = row[0] if row else ""
+                stock_items = r.json().get("items", [])
+                for s_data in stock_items:
+                    oid = s_data.get("officeId")
                     
-                    run(cur, """
-                        INSERT INTO stock
-                          (sku, variante_id, sucursal, oficina_id, stock,
-                           cantidad_por_despachar, cantidad_disponible, por_recibir, fecha_actualizacion)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        ON DUPLICATE KEY UPDATE
-                          stock=VALUES(stock), cantidad_por_despachar=VALUES(cantidad_por_despachar),
-                          cantidad_disponible=VALUES(cantidad_disponible), por_recibir=VALUES(por_recibir),
-                          fecha_actualizacion=VALUES(fecha_actualizacion)
-                    """, (
-                        sku[:100], vid, oname, oid,
-                        float(s_data.get("quantity") or 0), float(s_data.get("quantityReserved") or 0),
-                        float(s_data.get("quantityAvailable") or s_data.get("quantity") or 0),
-                        float(s_data.get("quantityOnOrder") or 0), datetime.now()
-                    ))
-                    conn.commit()
-                    cur.close()
-                    conn.close()
+                    # Fetch office name
+                    oname = ""
+                    if oid:
+                        ro = requests.get(f"{API}/offices/{oid}.json", headers=H)
+                        if ro.status_code == 200: oname = safe(ro.json().get("name",""), 150)
+                    
+                    # Insert/Update stock
+                    if oid:
+                        conn = get_db()
+                        cur = conn.cursor()
+                        cur.execute("SELECT sku FROM productos WHERE variante_id=%s LIMIT 1", (vid,))
+                        row = cur.fetchone()
+                        sku = row[0] if row else ""
+                        
+                        run(cur, """
+                            INSERT INTO stock
+                              (sku, variante_id, sucursal, oficina_id, stock,
+                               cantidad_por_despachar, cantidad_disponible, por_recibir, fecha_actualizacion)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON DUPLICATE KEY UPDATE
+                              stock=VALUES(stock), cantidad_por_despachar=VALUES(cantidad_por_despachar),
+                              cantidad_disponible=VALUES(cantidad_disponible), por_recibir=VALUES(por_recibir),
+                              fecha_actualizacion=VALUES(fecha_actualizacion)
+                        """, (
+                            sku[:100], vid, oname, oid,
+                            float(s_data.get("quantity") or 0), float(s_data.get("quantityReserved") or 0),
+                            float(s_data.get("quantityAvailable") or s_data.get("quantity") or 0),
+                            float(s_data.get("quantityOnOrder") or 0), datetime.now()
+                        ))
+                        conn.commit()
+                        cur.close()
+                        conn.close()
 
         logger.info(f"✅ Webhook procesado: {topic} {res_id}")
         return jsonify({"status": "ok"}), 200
