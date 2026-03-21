@@ -46,10 +46,8 @@ def process_product(pid: int):
     p = r.json()
 
     # Clasificacion
-    clasificacion = ""
-    if p.get("classificationId"):
-        rc = requests.get(f"{API}/classifications/{p['classificationId']}.json", headers=H)
-        if rc.status_code == 200: clasificacion = safe(rc.json().get("name", ""))
+    clasif_map = {0: "Producto", 1: "Servicio", 2: "Pack", 3: "Pack"}
+    clasificacion = clasif_map.get(p.get("classification", 0), "Producto")
 
     # Tipo de producto
     tipo = ""
