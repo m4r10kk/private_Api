@@ -1,10 +1,3 @@
-"""
-=============================================================
-  BSALE → MYSQL WEBHOOK SERVER (NUEVO SCHEMA 7 TABLAS)
-  Servidor Flask que recibe eventos de Bsale en tiempo real
-  y los persiste en MySQL (Railway)
-=============================================================
-"""
 import os, json, logging, requests, mysql.connector
 from datetime import datetime
 from flask import Flask, request, jsonify
@@ -20,42 +13,42 @@ DB_CONFIG = {
     "port":     int(os.getenv("DB_PORT", 40540)),
     "database": os.getenv("DB_NAME", "railway"),
     "user":     os.getenv("DB_USER", "root"),
-    "password": os.getenv("DB_PASSWORD", ""),
+    "password": os.getenv("DB_PASSWORD", "FhvVYldnOznZDRshCVtRDNelhEMmUMIQ"),
 }
 
-BSALE_TOKEN = os.getenv("BSALE_TOKEN", "")
+BSALE_TOKEN = "4128ca5461bb908cc3fc93a75dd8addcc843dce0"
 API = "https://api.bsale.io/v1"
 H = {"access_token": BSALE_TOKEN, "Content-Type": "application/json"}
 
-def safe(v, length=255): return str(v or "")[:length]
+def safe(v): return str(v).strip() if v else ""
 def ts(v): return datetime.fromtimestamp(v) if v else None
 
 def get_db(): return mysql.connector.connect(**DB_CONFIG)
 
 def run(cursor, sql, args=()):
-    cursor.execute(sql, args)
+    try:
+        cursor.execute(sql, args)
+    except Exception as e:
+        logger.error(f"SQL Error: {e} -> {sql}")
 
 # ─────────────────────────────────────────
 # PROCESADORES (WEBHOOKS)
 # ─────────────────────────────────────────
 
 def process_product(pid: int):
-    """Procesa un producto que ha sido creado o actualizado en Bsale"""
+    """Procesa un producto o variante"""
     r = requests.get(f"{API}/products/{pid}.json", headers=H)
     if r.status_code != 200: return
     p = r.json()
 
-    # Clasificacion
     clasif_map = {0: "Producto", 1: "Servicio", 2: "Pack", 3: "Pack"}
     clasificacion = clasif_map.get(p.get("classification", 0), "Producto")
 
-    # Tipo de producto
     tipo = ""
     if p.get("productTypeId"):
         rt = requests.get(f"{API}/product_types/{p['productTypeId']}.json", headers=H)
         if rt.status_code == 200: tipo = safe(rt.json().get("name", ""))
 
-    # Marca (brand)
     marca = ""
     if p.get("brandId"):
         rb = requests.get(f"{API}/brands/{p['brandId']}.json", headers=H)
@@ -63,7 +56,6 @@ def process_product(pid: int):
 
     estado_prod = "Activo" if p.get("state") == 0 else "Inactivo"
 
-    # Variantes
     rv = requests.get(f"{API}/products/{pid}/variants.json", headers=H)
     variantes = rv.json().get("items", []) if rv.status_code == 200 else []
 
@@ -73,28 +65,25 @@ def process_product(pid: int):
         for v in variantes:
             vid = v.get("id")
             estado_var = "Activo" if v.get("state") == 0 else "Inactivo"
-            sku = safe(v.get("code",""), 100)
+            sku = safe(v.get("code",""))
+            if not sku: continue
+            
+            # Since Pandas to_sql has no PK, we DELETE before INSERT to act like REPLACE
+            run(cursor, "DELETE FROM productos WHERE sku=%s", (sku,))
             
             run(cursor, """
                 INSERT INTO productos
-                  (id, sku, nombre, clasificacion, tipo_producto, estado, variante,
-                   codigo_barra, marca, estado_variante, fecha_creacion,
-                   variante_id, producto_id_bsale)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON DUPLICATE KEY UPDATE
-                  sku=VALUES(sku), nombre=VALUES(nombre),
-                  clasificacion=VALUES(clasificacion), tipo_producto=VALUES(tipo_producto),
-                  estado=VALUES(estado), variante=VALUES(variante),
-                  codigo_barra=VALUES(codigo_barra), marca=VALUES(marca),
-                  estado_variante=VALUES(estado_variante),
-                  fecha_creacion=VALUES(fecha_creacion)
+                  (sku, nombre_del_producto, clasificacion, tipo_de_producto, estado, variante,
+                   codigo_de_barras, marca, estado_variante, fecha_de_creacion)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (
-                vid, sku, safe(p.get("name",""), 255), clasificacion[:150], tipo[:150],
-                estado_prod, safe(v.get("description",""), 255), safe(v.get("barCode",""), 100),
-                marca[:150], estado_var, ts(p.get("createdAt")), vid, pid
+                sku, safe(p.get("name","")), clasificacion, tipo,
+                estado_prod, safe(v.get("description","")), safe(v.get("barcode","")),
+                marca, estado_var, safe(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             ))
 
-            # Costos (endpoint correcto)
+            # Costos
+            run(cursor, "DELETE FROM costos WHERE sku=%s", (sku,))
             avg_cost, last_cost = 0.0, 0.0
             r_cost = requests.get(f"{API}/variants/{vid}/costs.json", headers=H)
             if r_cost.status_code == 200:
@@ -102,32 +91,20 @@ def process_product(pid: int):
                 avg_cost = float(cost_data.get("averageCost") or 0)
                 history = cost_data.get("history", [])
                 if history:
-                    last_cost = float(sorted(history, key=lambda x: x.get("admissionDate",0), reverse=True)[0].get("cost") or 0)
+                    lc = sorted(history, key=lambda x: x.get("admissionDate",0), reverse=True)[0].get("cost")
+                    if lc is not None: last_cost = float(lc)
 
-            run(cursor, """
-                INSERT INTO costos (sku, variante_id, costo_neto_unitario, ultimo_costo, fecha_actualizacion)
-                VALUES (%s,%s,%s,%s,%s)
-                ON DUPLICATE KEY UPDATE
-                  costo_neto_unitario=VALUES(costo_neto_unitario),
-                  ultimo_costo=VALUES(ultimo_costo),
-                  fecha_actualizacion=VALUES(fecha_actualizacion)
-            """, (sku, vid, avg_cost, last_cost, datetime.now()))
+            run(cursor, "INSERT INTO costos (sku, costo_neto_unitario, ultimo_costo) VALUES (%s,%s,%s)", (sku, avg_cost, last_cost))
 
             # Precios
+            run(cursor, "DELETE FROM lista_de_precio WHERE sku=%s", (sku,))
             rp = requests.get(f"{API}/variants/{vid}/prices.json", headers=H)
             if rp.status_code == 200:
                 for pr in rp.json().get("items", []):
-                    run(cursor, """
-                        INSERT INTO listas_precios
-                          (lista_precio, lista_precio_id, sku, variante_id, precio_unitario, moneda, fecha_actualizacion)
-                        VALUES (%s,%s,%s,%s,%s,'PEN',%s)
-                        ON DUPLICATE KEY UPDATE
-                          precio_unitario=VALUES(precio_unitario),
-                          fecha_actualizacion=VALUES(fecha_actualizacion)
-                    """, (
-                        safe(pr.get("priceList", {}).get("name","") if pr.get("priceList") else "", 150),
-                        pr.get("priceListId"), sku, vid, float(pr.get("variantValuePrice") or 0), datetime.now()
-                    ))
+                    pl = pr.get("priceList", {})
+                    pl_name = pl.get("name","") if pl else ""
+                    val = float(pr.get("variantValuePrice", 0) or pr.get("price", 0))
+                    run(cursor, "INSERT INTO lista_de_precio (lista_de_precio, sku, precio_unitario) VALUES (%s,%s,%s)", (safe(pl_name), sku, val))
         conn.commit()
     finally:
         cursor.close()
@@ -139,29 +116,22 @@ def process_client(cid: int):
     c = r.json()
 
     estado = "Activo" if c.get("state") == 0 else "Inactivo"
-    tipo = "Empresa" if c.get("company") else "Persona Natural"
-
+    ruc = safe(c.get("code",""))
+    if not ruc: return
+    
     conn = get_db()
     try:
         cursor = conn.cursor()
+        run(cursor, "DELETE FROM cliente WHERE ruc=%s", (ruc,))
         run(cursor, """
-            INSERT INTO clientes
-              (id, ruc, nombre, apellido, distrito, ciudad, direccion,
-               correo, razon_social, estado, tipo_cliente,
-               fecha_creacion, fecha_actualizacion)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON DUPLICATE KEY UPDATE
-              ruc=VALUES(ruc), nombre=VALUES(nombre), apellido=VALUES(apellido),
-              distrito=VALUES(distrito), ciudad=VALUES(ciudad),
-              direccion=VALUES(direccion), correo=VALUES(correo),
-              razon_social=VALUES(razon_social), estado=VALUES(estado),
-              tipo_cliente=VALUES(tipo_cliente), fecha_actualizacion=VALUES(fecha_actualizacion)
+            INSERT INTO cliente
+              (ruc, apellido, correo, direccion_del_cliente, distrito_del_cliente,
+               estado, fecha_de_actualizacion, fecha_de_creacion)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
-            c.get("id"), safe(c.get("code",""), 20), safe(c.get("firstName",""), 255),
-            safe(c.get("lastName",""), 255), safe(c.get("district",""), 100),
-            safe(c.get("city",""), 100), safe(c.get("address",""), 500),
-            safe(c.get("email",""), 255), safe(c.get("company",""), 255),
-            estado, tipo, ts(c.get("createdAt")), ts(c.get("updatedAt"))
+            ruc, safe(c.get("lastName","") + " " + c.get("firstName","")), safe(c.get("email","")),
+            safe(c.get("address","")), safe(c.get("district","")), estado,
+            safe(datetime.now().strftime("%Y-%m-%d %H:%M:%S")), safe(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         ))
         conn.commit()
     finally:
@@ -178,12 +148,12 @@ def process_document(did: int):
     tipo_doc = ""
     if doc.get("documentTypeId"):
         rdt = requests.get(f"{API}/document_types/{doc['documentTypeId']}.json", headers=H)
-        if rdt.status_code == 200: tipo_doc = safe(rdt.json().get("name",""), 100)
+        if rdt.status_code == 200: tipo_doc = safe(rdt.json().get("name",""))
 
     nro = str(doc.get("number",""))
     partes = nro.split("-") if "-" in nro else ["", nro]
-    prefijo = partes[0][:20] if len(partes) > 1 else ""
-    num_serie = partes[1][:20] if len(partes) > 1 else nro[:20]
+    prefijo = partes[0] if len(partes) > 1 else ""
+    num_serie = partes[1] if len(partes) > 1 else nro
 
     em_ts = doc.get("emissionDate") or doc.get("createdAt")
     fecha_emision = ts(em_ts).date() if ts(em_ts) else None
@@ -193,25 +163,25 @@ def process_document(did: int):
     sucursal, oid = "", doc.get("officeId")
     if oid:
         ro = requests.get(f"{API}/offices/{oid}.json", headers=H)
-        if ro.status_code == 200: sucursal = safe(ro.json().get("name",""), 150)
+        if ro.status_code == 200: sucursal = safe(ro.json().get("name",""))
 
     vendedor = ""
     if doc.get("userId"):
         ru = requests.get(f"{API}/users/{doc['userId']}.json", headers=H)
         if ru.status_code == 200:
             ud = ru.json()
-            vendedor = safe(f"{ud.get('firstName','')} {ud.get('lastName','')}".strip(), 150)
+            vendedor = safe(f"{ud.get('firstName','')} {ud.get('lastName','')}")
 
     metodo_pago = ""
     rpa = requests.get(f"{API}/documents/{did}/payments.json", headers=H)
     if rpa.status_code == 200:
         pagos = rpa.json().get("items", [])
         if pagos and pagos[0].get("paymentType"):
-            metodo_pago = safe(pagos[0]["paymentType"].get("name",""), 100)
+            metodo_pago = safe(pagos[0]["paymentType"].get("name",""))
 
     ruc_cli, cli_id = "", None
     if doc.get("client"):
-        ruc_cli = safe(doc["client"].get("code",""), 20)
+        ruc_cli = safe(doc["client"].get("code",""))
         cli_id = doc["client"].get("id")
 
     # --- ORQUESTADOR: Sincronizar cliente inmediatamente ---
@@ -221,27 +191,22 @@ def process_document(did: int):
     conn = get_db()
     try:
         cursor = conn.cursor()
+        run(cursor, "DELETE FROM documentos WHERE numero_de_serie=%s", (num_serie,))
         run(cursor, """
             INSERT INTO documentos
-              (id, tipo_documento, nro_documento, prefijo_serie, numero_serie,
-               ruc_cliente, cliente_id, fecha_emision, fecha_vencimiento,
-               fecha_generacion, sucursal, oficina_id, emisor, vendedor,
-               estado, metodo_pago, monto_documento)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON DUPLICATE KEY UPDATE
-              tipo_documento=VALUES(tipo_documento),
-              estado=VALUES(estado), metodo_pago=VALUES(metodo_pago),
-              monto_documento=VALUES(monto_documento),
-              vendedor=VALUES(vendedor)
+              (tipo_documento, n_documento, prefijo_del_numero_de_serie, numero_de_serie,
+               ruc_cliente, fecha_emision, fecha_vencimiento, fecha_de_generacion, sucursal, 
+               emisor, vendedor, estado, metodo_de_pago, monto_de_documento)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
-            did, tipo_doc, nro[:50], prefijo, num_serie, ruc_cli, cli_id,
-            fecha_emision, fecha_venc, fecha_gen, sucursal, oid, "",
+            tipo_doc, nro, prefijo, num_serie, ruc_cli,
+            fecha_emision, fecha_venc, fecha_gen, sucursal, "",
             vendedor, estado_map.get(doc.get("state",0), "VIGENTE"),
             metodo_pago, float(doc.get("totalAmount") or 0)
         ))
 
-        # Detalles
-        cursor.execute("DELETE FROM ventas WHERE documento_id=%s", (did,))
+        # Detalles (Ventas)
+        cursor.execute("DELETE FROM venta WHERE numero_de_serie=%s", (num_serie,))
         rdet = requests.get(f"{API}/documents/{did}/details.json", headers=H)
         variantes_vendidas = set()
         if rdet.status_code == 200:
@@ -250,21 +215,19 @@ def process_document(did: int):
                 sku_det = ""
                 if vid:
                     variantes_vendidas.add(vid)
-                    cursor.execute("SELECT sku FROM productos WHERE variante_id=%s LIMIT 1", (vid,))
-                    row = cursor.fetchone()
-                    sku_det = row[0] if row else ""
+                    rv_det = requests.get(f"{API}/variants/{vid}.json", headers=H)
+                    if rv_det.status_code == 200:
+                        sku_det = rv_det.json().get("code","")
 
                 fecha_dt = ts(em_ts)
                 run(cursor, """
-                    INSERT INTO ventas
-                      (documento_id, tipo_movimiento, numero_serie,
-                       fecha_venta, hora_venta, sku, variante_id,
-                       cantidad, subtotal_neto)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    INSERT INTO venta
+                      (tipo_movimiento, numero_de_serie, fecha_venta, hora_venta, sku, cantidad, venta_total_neta)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
                 """, (
-                    did, tipo_doc, nro[:50], fecha_emision,
+                    tipo_doc, num_serie, fecha_emision,
                     fecha_dt.strftime("%H:%M:%S") if fecha_dt else None,
-                    sku_det[:100], vid, float(det.get("quantity") or 0),
+                    safe(sku_det), float(det.get("quantity") or 0),
                     float(det.get("totalUnitValue") or 0) * float(det.get("quantity") or 0)
                 ))
         conn.commit()
@@ -276,7 +239,6 @@ def process_document(did: int):
     for vid in variantes_vendidas:
         process_stock_for_variant(vid)
 
-# ── FUNCION EXTRAIDA PARA STOCK ──
 def process_stock_for_variant(vid: int):
     r = requests.get(f"{API}/stocks.json?variantid={vid}", headers=H)
     if r.status_code != 200: return
@@ -286,46 +248,41 @@ def process_stock_for_variant(vid: int):
     conn = get_db()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT sku FROM productos WHERE variante_id=%s LIMIT 1", (vid,))
-        row = cur.fetchone()
-        sku = row[0] if row else ""
+        r_vid = requests.get(f"{API}/variants/{vid}.json", headers=H)
+        sku = r_vid.json().get("code","") if r_vid.status_code == 200 else ""
+        if not sku: return
+        
+        # Eliminar stock actual de esta variante para reinsertarlo (todas las sucursales)
+        run(cur, "DELETE FROM stock WHERE sku=%s", (sku,))
         
         for s_data in stock_items:
             oid = s_data.get("officeId")
             if not oid: continue
             
-            # Fetch office name
             oname = ""
             ro = requests.get(f"{API}/offices/{oid}.json", headers=H)
-            if ro.status_code == 200: oname = safe(ro.json().get("name",""), 150)
+            if ro.status_code == 200: oname = safe(ro.json().get("name",""))
             
             run(cur, """
                 INSERT INTO stock
-                  (sku, variante_id, sucursal, oficina_id, stock,
-                   cantidad_por_despachar, cantidad_disponible, por_recibir, fecha_actualizacion)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON DUPLICATE KEY UPDATE
-                  stock=VALUES(stock), cantidad_por_despachar=VALUES(cantidad_por_despachar),
-                  cantidad_disponible=VALUES(cantidad_disponible), por_recibir=VALUES(por_recibir),
-                  fecha_actualizacion=VALUES(fecha_actualizacion)
+                  (sku, stock, cantidad_por_despachar, cantidad_disponible, por_recibir, sucursal)
+                VALUES (%s,%s,%s,%s,%s,%s)
             """, (
-                sku[:100], vid, oname, oid,
-                float(s_data.get("quantity") or 0), float(s_data.get("quantityReserved") or 0),
+                sku, float(s_data.get("quantity") or 0), float(s_data.get("quantityReserved") or 0),
                 float(s_data.get("quantityAvailable") or s_data.get("quantity") or 0),
-                float(s_data.get("quantityOnOrder") or 0), datetime.now()
+                float(s_data.get("quantityOnOrder") or 0), oname
             ))
         conn.commit()
     finally:
         cur.close()
         conn.close()
 
-
 # ─────────────────────────────────────────
 # ENDPOINTS
 # ─────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "mensaje": "Servidor Bsale→MySQL activo (Nuevo Schema)"}), 200
+    return jsonify({"status": "ok", "mensaje": "Servidor Bsale→MySQL Excel Schema activo"}), 200
 
 @app.route("/webhook/bsale", methods=["POST"])
 def webhook_bsale():
@@ -343,15 +300,11 @@ def webhook_bsale():
         elif topic in ("client/create", "client.create", "client/update", "client.update", "client"):
             process_client(res_id)
         elif topic in ("stock/update", "stock.update", "stock"):
-            # En webhooks v2 de stock, el resourceId suele ser un stockId en vez de variantId
-            # Intentamos primero consultarlo como stockId
             r_stock = requests.get(f"{API}/stocks/{res_id}.json", headers=H)
             if r_stock.status_code == 200 and r_stock.json().get("variantId"):
-                # Efectivamente fue un stockId, extraemos la variante y actualizamos
                 vid = r_stock.json().get("variantId")
                 process_stock_for_variant(vid)
             else:
-                # Fallback: Asumimos que mandaron el variantId
                 process_stock_for_variant(res_id)
 
         logger.info(f"✅ Webhook procesado: {topic} {res_id}")
