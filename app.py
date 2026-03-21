@@ -214,6 +214,10 @@ def process_document(did: int):
         ruc_cli = safe(doc["client"].get("code",""), 20)
         cli_id = doc["client"].get("id")
 
+    # --- ORQUESTADOR: Sincronizar cliente inmediatamente ---
+    if cli_id:
+        process_client(cli_id)
+
     conn = get_db()
     try:
         cursor = conn.cursor()
@@ -239,11 +243,13 @@ def process_document(did: int):
         # Detalles
         cursor.execute("DELETE FROM ventas WHERE documento_id=%s", (did,))
         rdet = requests.get(f"{API}/documents/{did}/details.json", headers=H)
+        variantes_vendidas = set()
         if rdet.status_code == 200:
             for det in rdet.json().get("items", []):
                 vid = det.get("variantId")
                 sku_det = ""
                 if vid:
+                    variantes_vendidas.add(vid)
                     cursor.execute("SELECT sku FROM productos WHERE variante_id=%s LIMIT 1", (vid,))
                     row = cursor.fetchone()
                     sku_det = row[0] if row else ""
@@ -265,6 +271,54 @@ def process_document(did: int):
     finally:
         cursor.close()
         conn.close()
+
+    # --- ORQUESTADOR: Descontar stock inmediatamente tras procesar el documento ---
+    for vid in variantes_vendidas:
+        process_stock_for_variant(vid)
+
+# ── FUNCION EXTRAIDA PARA STOCK ──
+def process_stock_for_variant(vid: int):
+    r = requests.get(f"{API}/stocks.json?variantid={vid}", headers=H)
+    if r.status_code != 200: return
+    stock_items = r.json().get("items", [])
+    if not stock_items: return
+
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT sku FROM productos WHERE variante_id=%s LIMIT 1", (vid,))
+        row = cur.fetchone()
+        sku = row[0] if row else ""
+        
+        for s_data in stock_items:
+            oid = s_data.get("officeId")
+            if not oid: continue
+            
+            # Fetch office name
+            oname = ""
+            ro = requests.get(f"{API}/offices/{oid}.json", headers=H)
+            if ro.status_code == 200: oname = safe(ro.json().get("name",""), 150)
+            
+            run(cur, """
+                INSERT INTO stock
+                  (sku, variante_id, sucursal, oficina_id, stock,
+                   cantidad_por_despachar, cantidad_disponible, por_recibir, fecha_actualizacion)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON DUPLICATE KEY UPDATE
+                  stock=VALUES(stock), cantidad_por_despachar=VALUES(cantidad_por_despachar),
+                  cantidad_disponible=VALUES(cantidad_disponible), por_recibir=VALUES(por_recibir),
+                  fecha_actualizacion=VALUES(fecha_actualizacion)
+            """, (
+                sku[:100], vid, oname, oid,
+                float(s_data.get("quantity") or 0), float(s_data.get("quantityReserved") or 0),
+                float(s_data.get("quantityAvailable") or s_data.get("quantity") or 0),
+                float(s_data.get("quantityOnOrder") or 0), datetime.now()
+            ))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
 
 # ─────────────────────────────────────────
 # ENDPOINTS
@@ -289,46 +343,16 @@ def webhook_bsale():
         elif topic in ("client/create", "client.create", "client/update", "client.update", "client"):
             process_client(res_id)
         elif topic in ("stock/update", "stock.update", "stock"):
-            # En webhooks v2 de stock, el resourceId suele ser el variantId. Consultamos el endpoint de stocks filtrando por variante.
-            vid = res_id
-            r = requests.get(f"{API}/stocks.json?variantid={vid}", headers=H)
-            if r.status_code == 200:
-                stock_items = r.json().get("items", [])
-                for s_data in stock_items:
-                    oid = s_data.get("officeId")
-                    
-                    # Fetch office name
-                    oname = ""
-                    if oid:
-                        ro = requests.get(f"{API}/offices/{oid}.json", headers=H)
-                        if ro.status_code == 200: oname = safe(ro.json().get("name",""), 150)
-                    
-                    # Insert/Update stock
-                    if oid:
-                        conn = get_db()
-                        cur = conn.cursor()
-                        cur.execute("SELECT sku FROM productos WHERE variante_id=%s LIMIT 1", (vid,))
-                        row = cur.fetchone()
-                        sku = row[0] if row else ""
-                        
-                        run(cur, """
-                            INSERT INTO stock
-                              (sku, variante_id, sucursal, oficina_id, stock,
-                               cantidad_por_despachar, cantidad_disponible, por_recibir, fecha_actualizacion)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                            ON DUPLICATE KEY UPDATE
-                              stock=VALUES(stock), cantidad_por_despachar=VALUES(cantidad_por_despachar),
-                              cantidad_disponible=VALUES(cantidad_disponible), por_recibir=VALUES(por_recibir),
-                              fecha_actualizacion=VALUES(fecha_actualizacion)
-                        """, (
-                            sku[:100], vid, oname, oid,
-                            float(s_data.get("quantity") or 0), float(s_data.get("quantityReserved") or 0),
-                            float(s_data.get("quantityAvailable") or s_data.get("quantity") or 0),
-                            float(s_data.get("quantityOnOrder") or 0), datetime.now()
-                        ))
-                        conn.commit()
-                        cur.close()
-                        conn.close()
+            # En webhooks v2 de stock, el resourceId suele ser un stockId en vez de variantId
+            # Intentamos primero consultarlo como stockId
+            r_stock = requests.get(f"{API}/stocks/{res_id}.json", headers=H)
+            if r_stock.status_code == 200 and r_stock.json().get("variantId"):
+                # Efectivamente fue un stockId, extraemos la variante y actualizamos
+                vid = r_stock.json().get("variantId")
+                process_stock_for_variant(vid)
+            else:
+                # Fallback: Asumimos que mandaron el variantId
+                process_stock_for_variant(res_id)
 
         logger.info(f"✅ Webhook procesado: {topic} {res_id}")
         return jsonify({"status": "ok"}), 200
